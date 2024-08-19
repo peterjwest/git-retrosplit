@@ -6,13 +6,12 @@ command=${1:-}
 
 usage="$(cat <<EOF
 
-Usage: $(basename "$0") [-h | --help] [--continue | --finish | --abort]
+Usage: $(basename "$0") [--continue | --abort] [-h | --help]
 
 Split a commit into multiple commits by working backwards
 
 Options:
   --continue  Split the commit further
-  --finish    Stop splitting the commit and clean up
   --abort     Abort the process and return to the original commit
   -h, --help  Print this usage information
 EOF
@@ -31,54 +30,70 @@ done
 for var in "$@"; do
   case "$var" in
     --continue)
-      if ! git diff --quiet && git diff --cached --quiet; then
-        echo 'Error: unstaged changes, aborting'
-        exit 1
-      fi
+      git clean -f
+      git restore .
 
-      commit="$(cat .rework/COMMIT)"
-      split_commit="$(git rev-parse HEAD)"
-      current="$(cat .rework/CURRENT)"
+      count="$(cat .git/rework/COUNT)"
+      git commit -m "Rework $count"
+      echo "$(($count + 1))" > .git/rework/COUNT
+
+      branch="$(cat .git/rework/BRANCH)"
+      commit="$(git rev-parse HEAD)"
 
       # If the diff is empty, this is the last (first) commit
-      if [ -z "$(git diff "$current" "$split_commit" --binary)" ]; then
+      if [ -z "$(git diff git/rework "$commit" --binary)" ]; then
+        echo $(git rev-list "$branch..git/rework")
 
-        for temp_commit in $(git rev-list "$commit..$current" | tail -r); do
-          git revert "$temp_commit" --no-commit
-          git commit -C "$temp_commit"
+        count=1
+        git commit --amend -m "Rework $((count++))"
+
+        # Apply the reverse of all the commits as a replacement to the original commit
+        for tempCommit in $(git rev-list "$branch..git/rework"); do
+          git revert "$tempCommit" --no-commit
+          git commit -m "Rework $((count++))"
         done
-        # git revert "$commit..$current"
         final="$(git rev-parse HEAD)"
 
-        if git show-ref --verify "refs/heads/$commit" -q; then
-          git branch -f "$commit" "$final"
-          git checkout "$commit"
-        fi
+        git branch -f "$branch" "$final"
+        git checkout "$branch"
 
-        rm -rf .rework
+        git branch -D git/rework
+        rm -rf .git/rework
 
         exit 0
       fi
 
-      git checkout "$current" -q
-      git diff "$current" "$split_commit" --binary | git apply --index
-      git commit -C "$split_commit"
-      current="$(git rev-parse HEAD)"
-      echo "$current" > .rework/CURRENT
+      # Take the commit and apply to to the temporary branch
+      git checkout git/rework -q
+      git diff git/rework "$commit" --binary | git apply --index
+      git commit -C "$commit"
 
-      parent="$(git rev-parse "$commit^")"
-      git checkout "$parent" -q
-      git cherry-pick "..$current" -n
+      # Checkout the base commit again
+      base="$(git rev-parse "$commit^")"
+      git checkout "$base" -q
+
+      # Apply remaining changes by cherry picking the original large commit,
+      # and all subsequent removals as one diff
+      git cherry-pick "..git/rework" -n
 
       exit 0
     ;;
     --abort)
       echo "Aborting"
 
-      commit="$(cat .rework/COMMIT)"
+      if [ ! -d ".git/rework" ]; then
+        echo "Git rework not in progress"
+        exit 1
+      fi
+
+      git clean -f
+      git reset --hard
+
+      commit="$(cat .git/rework/BRANCH)"
       git checkout .
       git checkout "$commit" -q
-      rm -rf .rework
+      git branch -D git/rework
+      rm -rf .git/rework
 
       exit 0
     ;;
@@ -91,14 +106,33 @@ for var in "$@"; do
   esac
 done
 
-mkdir -p .rework
+if [ -d ".git/rework" ]; then
+  branch="$(cat .git/rework/BRANCH)"
+  echo "Git rework already in progress on $branch ($(git rev-parse --short $branch))"
+  exit 1
+fi
 
-commit="$(git symbolic-ref --short HEAD -q || git rev-parse HEAD)"
-echo "$commit" > .rework/COMMIT
-current="$(git rev-parse HEAD)"
-echo "$current" > .rework/CURRENT
+echo "Starting git rework on $(git symbolic-ref --short HEAD -q) ($(git rev-parse --short HEAD))"
 
-# git checkout -b _rework || true
-parent="$(git rev-parse "$commit^")"
-git checkout "$parent" -q
-git cherry-pick "..$commit" -n
+if ! git symbolic-ref --short HEAD -q; then
+  echo "Error: Git rework only works on a branch, you are in detatched HEAD state"
+  exit 1
+fi
+
+if ! git diff --quiet || ! git diff --cached --quiet; then
+  echo 'Error: uncommitted changes, Git rework requires a clean branch'
+  exit 1
+fi
+
+mkdir -p .git/rework
+
+branch="$(git symbolic-ref --short HEAD -q)"
+echo "$branch" > .git/rework/BRANCH
+echo "1" > .git/rework/COUNT
+
+git branch git/rework $(git rev-parse HEAD)
+
+base="$(git rev-parse "$branch^")"
+git checkout "$base" -q
+git cherry-pick "..$branch" -n
+
